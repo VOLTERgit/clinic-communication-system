@@ -1,9 +1,7 @@
 """
 Clinic Connect - Server v2
-- Full message history stored in SQLite
-- Sends chat history to clients on connect
-- Presence updates
-- Offline message queuing
+Auto-opens Windows Firewall port 8765
+Shows all local IPs so staff know which one to use
 """
 
 import asyncio
@@ -12,6 +10,8 @@ import sqlite3
 import logging
 import os
 import sys
+import socket
+import subprocess
 from datetime import datetime
 
 # ── Work directory fix for PyInstaller ──
@@ -29,8 +29,7 @@ from websockets.server import serve
 # ── Disable Windows Quick Edit Mode ──────────────────────────────────────────
 def disable_quick_edit():
     try:
-        import ctypes
-        import ctypes.wintypes
+        import ctypes, ctypes.wintypes
         kernel32 = ctypes.windll.kernel32
         handle = kernel32.GetStdHandle(-10)
         mode = ctypes.wintypes.DWORD()
@@ -43,6 +42,59 @@ def disable_quick_edit():
 
 disable_quick_edit()
 
+# ── Auto-open firewall port ───────────────────────────────────────────────────
+def open_firewall_port():
+    """Add Windows Firewall rule for port 8765 automatically."""
+    try:
+        rule_name = "Clinic Connect Server"
+        # Delete old rule first (ignore errors)
+        subprocess.run(
+            ["netsh", "advfirewall", "firewall", "delete", "rule",
+             f"name={rule_name}"],
+            capture_output=True
+        )
+        # Add new inbound rule
+        result = subprocess.run(
+            ["netsh", "advfirewall", "firewall", "add", "rule",
+             f"name={rule_name}",
+             "dir=in",
+             "action=allow",
+             "protocol=TCP",
+             f"localport=8765"],
+            capture_output=True, text=True
+        )
+        if result.returncode == 0:
+            print("  Firewall: Port 8765 opened successfully")
+        else:
+            print("  Firewall: Could not auto-open port (run as Admin to fix)")
+            print("  Manual fix: Allow port 8765 in Windows Firewall")
+    except Exception as e:
+        print(f"  Firewall: {e}")
+
+# ── Get all local IPs ─────────────────────────────────────────────────────────
+def get_local_ips():
+    ips = []
+    try:
+        hostname = socket.gethostname()
+        infos = socket.getaddrinfo(hostname, None)
+        for info in infos:
+            ip = info[4][0]
+            if ip.startswith("192.168.") or ip.startswith("10.") or ip.startswith("172."):
+                if ip not in ips:
+                    ips.append(ip)
+    except Exception:
+        pass
+    # Fallback method
+    if not ips:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ips.append(s.getsockname()[0])
+            s.close()
+        except Exception:
+            pass
+    return ips
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(message)s",
@@ -54,6 +106,7 @@ log = logging.getLogger(__name__)
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
+    # Create table if it doesn't exist at all
     conn.execute("""
         CREATE TABLE IF NOT EXISTS messages (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -68,8 +121,17 @@ def init_db():
         )
     """)
     conn.commit()
+
+    # ── Migrate old databases that are missing the created_at column ──
+    columns = [row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()]
+    if "created_at" not in columns:
+        conn.execute("ALTER TABLE messages ADD COLUMN created_at TEXT")
+        # Fill existing rows with a sensible default
+        conn.execute("UPDATE messages SET created_at = datetime('now') WHERE created_at IS NULL")
+        conn.commit()
+        log.info("Database migrated: added created_at column")
+
     conn.close()
-    log.info(f"Database ready: {DB_PATH}")
 
 def db_save(sender, recipient, mtype, content, timestamp):
     conn = sqlite3.connect(DB_PATH)
@@ -93,7 +155,6 @@ def db_set_status(mid, status):
     conn.close()
 
 def db_pending(user_id):
-    """Messages sent to user while they were offline (still pending)."""
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
@@ -104,11 +165,6 @@ def db_pending(user_id):
     return [dict(r) for r in rows]
 
 def db_history(user_id):
-    """
-    Full chat history for a user — all messages sent/received,
-    excluding pending (those will come as offline notifications separately).
-    Returns messages from the last 7 days for performance.
-    """
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
@@ -124,7 +180,7 @@ def db_history(user_id):
 
 # ── Connection Manager ────────────────────────────────────────────────────────
 
-CLIENTS = {}  # user_id -> websocket
+CLIENTS = {}
 
 async def send_to(user_id, data):
     ws = CLIENTS.get(user_id)
@@ -164,13 +220,12 @@ async def handle(sender, data):
                 await send_to(orig, {"type": "status_update", "id": mid, "status": "read"})
         return
 
-    # Route notification/message to recipients
     recipients = data.get("recipients", [])
     if isinstance(recipients, str):
         recipients = [recipients]
     timestamp = data.get("timestamp", datetime.now().strftime("%I:%M %p"))
-    content = data.get("content", "")
-    temp_id = data.get("temp_id")
+    content   = data.get("content", "")
+    temp_id   = data.get("temp_id")
 
     for recipient in recipients:
         mid = db_save(sender, recipient, t, content, timestamp)
@@ -186,7 +241,6 @@ async def handle(sender, data):
         })
         status = "delivered" if delivered else "pending"
         db_set_status(mid, status)
-        # Tell sender: delivered (with temp_id so client can remap bubble)
         await send_to(sender, {
             "type": "status_update",
             "id": mid,
@@ -204,7 +258,7 @@ async def on_connect(websocket):
     log.info(f"CONNECTED: {user_id}  |  Online: {list(CLIENTS.keys())}")
     await broadcast_presence()
 
-    # ── Send full chat history first ──
+    # Send full history
     history = db_history(user_id)
     if history:
         await send_to(user_id, {
@@ -222,9 +276,8 @@ async def on_connect(websocket):
                 for m in history
             ]
         })
-        log.info(f"Sent {len(history)} history msgs to {user_id}")
 
-    # ── Deliver pending (offline) messages ──
+    # Deliver pending offline messages
     pending = db_pending(user_id)
     for msg in pending:
         await send_to(user_id, {
@@ -259,14 +312,36 @@ async def on_connect(websocket):
 
 async def main():
     init_db()
-    print("=" * 50)
-    print("  Clinic Connect - Server v2")
-    print("  Listening on: 0.0.0.0:8765")
+
+    # Auto open firewall
+    open_firewall_port()
+
+    # Get IPs
+    ips = get_local_ips()
+
+    print("")
+    print("=" * 52)
+    print("   Clinic Connect - Server")
+    print("=" * 52)
+    print("")
+    if ips:
+        print("  >>> USE THIS IP ON OTHER PCs <<<")
+        print("")
+        for ip in ips:
+            print(f"      IP ADDRESS:  {ip}")
+        print("")
+    else:
+        print("  Could not detect IP. Run ipconfig in cmd.")
+        print("")
+    print("  Port:     8765")
     print(f"  Database: {DB_PATH}")
-    print("  Running... (minimize this window)")
-    print("=" * 50)
+    print("")
+    print("  Status: RUNNING - minimize this window")
+    print("=" * 52)
+    print("")
+
     async with serve(on_connect, "0.0.0.0", 8765, ping_interval=30, ping_timeout=20):
-        log.info("Server started on port 8765")
+        log.info("Server ready and waiting for connections...")
         await asyncio.Future()
 
 if __name__ == "__main__":
